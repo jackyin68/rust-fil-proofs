@@ -172,6 +172,7 @@ mod tests {
         hasher::{Domain, HashFunction, Hasher, PedersenHasher, PoseidonHasher},
         merkle::{generate_tree, get_base_tree_count, LCTree, MerkleTreeTrait},
     };
+    use storage_proofs_porep::nse::vanilla::hash_comm_r;
 
     use crate::nse_window::{
         self, ChallengeRequirements, PrivateInputs, PrivateSector, PublicInputs, PublicSector,
@@ -233,12 +234,15 @@ mod tests {
         let randomness = <Tree::Hasher as Hasher>::Domain::random(rng);
         let prover_id = <Tree::Hasher as Hasher>::Domain::random(rng);
         let window_challenge_count = 2;
+        let num_layers = 4;
 
         let setup_params = compound_proof::SetupParams {
             vanilla_params: nse_window::SetupParams {
                 sector_size: sector_size as u64,
+                window_size: 1024 * 1024,
                 window_challenge_count,
                 sector_count,
+                num_layers,
             },
             partitions: Some(partitions),
             priority: false,
@@ -258,16 +262,20 @@ mod tests {
             trees.push(tree);
         }
         for (i, tree) in trees.iter().enumerate() {
-            let comm_c = <Tree::Hasher as Hasher>::Domain::random(rng);
-            let comm_r_last = tree.root();
+            let comm_layers: Vec<_> = (0..num_layers - 1)
+                .map(|_| <Tree::Hasher as Hasher>::Domain::random(rng))
+                .collect();
+            let comm_replica = tree.root();
+
+            let comm_r: <Tree::Hasher as Hasher>::Domain =
+                hash_comm_r(&comm_layers, comm_replica).into();
 
             priv_sectors.push(PrivateSector {
                 tree,
-                comm_c,
-                comm_r_last,
+                comm_replica,
+                comm_layers,
             });
 
-            let comm_r = <Tree::Hasher as Hasher>::Function::hash2(&comm_c, &comm_r_last);
             pub_sectors.push(PublicSector {
                 id: (i as u64).into(),
                 comm_r,

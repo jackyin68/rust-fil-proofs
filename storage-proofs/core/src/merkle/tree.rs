@@ -122,6 +122,8 @@ impl<
         let proof = self.inner.gen_base_proof(i)?;
 
         debug_assert!(proof.validate::<H::Function>().expect("validate failed"));
+        debug_assert_eq!(proof.sub_layer_nodes(), 0);
+        debug_assert_eq!(proof.top_layer_nodes(), 0);
 
         MerkleProof::try_from_proof(proof)
     }
@@ -138,6 +140,8 @@ impl<
         let proof = self.inner.gen_cached_base_proof(i, rows_to_discard)?;
 
         debug_assert!(proof.validate::<H::Function>().expect("validate failed"));
+        debug_assert_eq!(proof.sub_layer_nodes(), 0);
+        debug_assert_eq!(proof.top_layer_nodes(), 0);
 
         MerkleProof::try_from_proof(proof)
     }

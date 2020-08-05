@@ -15,7 +15,7 @@ use storage_proofs_core::{
 };
 
 use super::{hash::*, LayerProof, NodeProof};
-use crate::nse::{Config, NarrowStackedExpander};
+use crate::nse::vanilla::{Config, NarrowStackedExpander};
 
 /// NSE Circuit.
 pub struct NseCircuit<'a, Tree: 'static + MerkleTreeTrait, G: 'static + Hasher> {

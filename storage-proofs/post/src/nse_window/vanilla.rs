@@ -4,20 +4,20 @@ use anyhow::ensure;
 use byteorder::{ByteOrder, LittleEndian};
 use generic_array::typenum::{Unsigned, U0};
 use log::trace;
-use paired::bls12_381::Fr;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use storage_proofs_core::{
     error::Result,
-    hasher::{Domain, HashFunction, Hasher},
+    hasher::{Domain, Hasher},
     merkle::{MerkleProof, MerkleProofTrait, MerkleTreeTrait, MerkleTreeWrapper},
     parameter_cache::ParameterSetMetadata,
     proof::ProofScheme,
     sector::*,
     util::{default_rows_to_discard, NODE_SIZE},
 };
+use storage_proofs_porep::nse::vanilla::hash_comm_r;
 
 #[derive(Debug, Clone)]
 pub struct SetupParams {
@@ -29,6 +29,8 @@ pub struct SetupParams {
     pub window_challenge_count: usize,
     /// Number of challenged sectors.
     pub sector_count: usize,
+    /// The total number of layers.
+    pub num_layers: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,8 @@ pub struct PublicParams {
     pub window_challenge_count: usize,
     /// Number of challenged sectors.
     pub sector_count: usize,
+    /// The total number of layers.
+    pub num_layers: usize,
 }
 
 impl PublicParams {
@@ -57,13 +61,7 @@ pub struct ChallengeRequirements {
 
 impl ParameterSetMetadata for PublicParams {
     fn identifier(&self) -> String {
-        format!(
-            "NseWindowPoSt::PublicParams{{sector_size: {}, window_size: {}, window_challenge_count: {}, sector_count: {}}}",
-            self.sector_size,
-            self.window_size,
-            self.window_challenge_count,
-            self.sector_count,
-        )
+        format!("NseWindowPoSt::PublicParams{{{:?}}}", self)
     }
 
     fn sector_size(&self) -> u64 {
@@ -83,10 +81,7 @@ pub struct PublicInputs<'a, T: Domain> {
 #[derive(Debug, Clone)]
 pub struct PublicSector<T: Domain> {
     pub id: SectorId,
-    /// The commitments for the individual layers.
-    pub comm_layers: Vec<T>,
-    /// The commitment of the replica.
-    pub comm_replica: T,
+    pub comm_r: T,
 }
 
 #[derive(Debug)]
@@ -98,7 +93,9 @@ pub struct PrivateSector<'a, Tree: MerkleTreeTrait> {
         Tree::SubTreeArity,
         Tree::TopTreeArity,
     >,
+    /// The root of the individual layers.
     pub comm_layers: Vec<<Tree::Hasher as Hasher>::Domain>,
+    /// The root of the replica layer.
     pub comm_replica: <Tree::Hasher as Hasher>::Domain,
 }
 
@@ -242,6 +239,7 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for NseWindowPoSt<'a, Tree>
             window_size: sp.window_size,
             window_challenge_count: sp.window_challenge_count,
             sector_count: sp.sector_count,
+            num_layers: sp.num_layers,
         })
     }
 
@@ -349,9 +347,16 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for NseWindowPoSt<'a, Tree>
                     })
                     .collect::<Result<Vec<_>>>()?;
 
+                let comm_layers = priv_sector.comm_layers.clone();
+                ensure!(
+                    comm_layers.len() == pub_params.num_layers - 1,
+                    "invalid number of layer commitments {} != {}",
+                    comm_layers.len(),
+                    pub_params.num_layers - 1
+                );
                 proofs.push(SectorProof {
                     inclusion_proofs,
-                    comm_layers: priv_sector.comm_layers.clone(),
+                    comm_layers,
                     comm_replica: priv_sector.comm_replica,
                 });
             }
@@ -373,99 +378,142 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for NseWindowPoSt<'a, Tree>
         pub_inputs: &Self::PublicInputs,
         partition_proofs: &[Self::Proof],
     ) -> Result<bool> {
-        todo!()
-        // let window_challenge_count = pub_params.window_challenge_count;
-        // let num_sectors_per_chunk = pub_params.sector_count;
-        // let num_sectors = pub_inputs.sectors.len();
+        let window_challenge_count = pub_params.window_challenge_count;
+        let num_sectors_per_chunk = pub_params.sector_count;
+        let num_sectors = pub_inputs.sectors.len();
 
-        // ensure!(
-        //     num_sectors <= num_sectors_per_chunk * partition_proofs.len(),
-        //     "inconsistent number of sectors: {} > {} * {}",
-        //     num_sectors,
-        //     num_sectors_per_chunk,
-        //     partition_proofs.len(),
-        // );
+        ensure!(
+            num_sectors <= num_sectors_per_chunk * partition_proofs.len(),
+            "inconsistent number of sectors: {} > {} * {}",
+            num_sectors,
+            num_sectors_per_chunk,
+            partition_proofs.len(),
+        );
 
-        // for (j, (proof, pub_sectors_chunk)) in partition_proofs
-        //     .iter()
-        //     .zip(pub_inputs.sectors.chunks(num_sectors_per_chunk))
-        //     .enumerate()
-        // {
-        //     ensure!(
-        //         pub_sectors_chunk.len() <= num_sectors_per_chunk,
-        //         "inconsistent number of public sectors: {} > {}",
-        //         pub_sectors_chunk.len(),
-        //         num_sectors_per_chunk,
-        //     );
-        //     ensure!(
-        //         proof.sectors.len() == num_sectors_per_chunk,
-        //         "invalid number of sectors in the partition proof {}: {} != {}",
-        //         j,
-        //         proof.sectors.len(),
-        //         num_sectors_per_chunk,
-        //     );
-        //     for (i, (pub_sector, sector_proof)) in pub_sectors_chunk
-        //         .iter()
-        //         .zip(proof.sectors.iter())
-        //         .enumerate()
-        //     {
-        //         let sector_id = pub_sector.id;
-        //         let comm_r = &pub_sector.comm_r;
-        //         let comm_c = sector_proof.comm_c;
-        //         let inclusion_proofs = &sector_proof.inclusion_proofs;
+        for (j, (proof, pub_sectors_chunk)) in partition_proofs
+            .iter()
+            .zip(pub_inputs.sectors.chunks(num_sectors_per_chunk))
+            .enumerate()
+        {
+            ensure!(
+                pub_sectors_chunk.len() <= num_sectors_per_chunk,
+                "inconsistent number of public sectors: {} > {}",
+                pub_sectors_chunk.len(),
+                num_sectors_per_chunk,
+            );
+            ensure!(
+                proof.sectors.len() == num_sectors_per_chunk,
+                "invalid number of sectors in the partition proof {}: {} != {}",
+                j,
+                proof.sectors.len(),
+                num_sectors_per_chunk,
+            );
 
-        //         // Verify that H(Comm_c || Comm_r_last) == Comm_R
+            for (i, (pub_sector, sector_proof)) in pub_sectors_chunk
+                .iter()
+                .zip(proof.sectors.iter())
+                .enumerate()
+            {
+                trace!("partition {}", i);
+                let sector_id = pub_sector.id;
+                let comm_r = &pub_sector.comm_r;
+                let comm_layers = &sector_proof.comm_layers;
+                let inclusion_proofs = &sector_proof.inclusion_proofs;
+                let comm_replica = sector_proof.comm_replica;
 
-        //         // comm_r_last is the root of the proof
-        //         let comm_r_last = inclusion_proofs[0].root();
+                // -- Verify that H(Comm_layers..| comm_replica) == Comm_R
+                let comm_r_expected: <Tree::Hasher as Hasher>::Domain =
+                    hash_comm_r(&comm_layers, comm_replica).into();
+                if AsRef::<[u8]>::as_ref(&comm_r_expected) != AsRef::<[u8]>::as_ref(comm_r) {
+                    trace!("invalid comm_r");
+                    return Ok(false);
+                }
 
-        //         if AsRef::<[u8]>::as_ref(&<Tree::Hasher as Hasher>::Function::hash2(
-        //             &comm_c,
-        //             &comm_r_last,
-        //         )) != AsRef::<[u8]>::as_ref(comm_r)
-        //         {
-        //             return Ok(false);
-        //         }
+                // -- Verify top part of the tree
+                let tree = MerkleTreeWrapper::<
+                    Tree::Hasher,
+                    merkletree::store::VecStore<<Tree::Hasher as Hasher>::Domain>,
+                    Tree::SubTreeArity,
+                    Tree::TopTreeArity,
+                    U0,
+                >::try_from_iter(
+                    inclusion_proofs.iter().map(|p| Ok(p[0].root()))
+                )?;
+                let comm_replica_expected = tree.root();
 
-        //         ensure!(
-        //             window_challenge_count == inclusion_proofs.len(),
-        //             "unexpected umber of inclusion proofs: {} != {}",
-        //             window_challenge_count,
-        //             inclusion_proofs.len()
-        //         );
+                if AsRef::<[u8]>::as_ref(&comm_replica_expected)
+                    != AsRef::<[u8]>::as_ref(&comm_replica)
+                {
+                    trace!("invalid comm_replica");
+                    return Ok(false);
+                }
 
-        //         for (n, inclusion_proof) in inclusion_proofs.iter().enumerate() {
-        //             let challenge_index = ((j * num_sectors_per_chunk + i)
-        //                 * pub_params.window_challenge_count
-        //                 + n) as u64;
-        //             let challenged_leaf_start = generate_leaf_challenge(
-        //                 pub_params,
-        //                 pub_inputs.randomness,
-        //                 sector_id.into(),
-        //                 challenge_index,
-        //             )?;
+                // -- Verify inclusion proofs
 
-        //             // validate all comm_r_lasts match
-        //             if inclusion_proof.root() != comm_r_last {
-        //                 return Ok(false);
-        //             }
+                ensure!(
+                    pub_params.num_windows() == inclusion_proofs.len(),
+                    "unexpected number of inclusion proofs: {} != {}",
+                    pub_params.num_windows(),
+                    inclusion_proofs.len()
+                );
 
-        //             // validate the path length
-        //             let expected_path_length =
-        //                 inclusion_proof.expected_len(pub_params.sector_size as usize / NODE_SIZE);
+                for (window_index, inclusion_proofs) in inclusion_proofs.iter().enumerate() {
+                    trace!("window {}", window_index);
+                    ensure!(
+                        window_challenge_count == inclusion_proofs.len(),
+                        "unexpected number of inclusion proofs: {} != {}",
+                        window_challenge_count,
+                        inclusion_proofs.len()
+                    );
 
-        //             if expected_path_length != inclusion_proof.path().len() {
-        //                 return Ok(false);
-        //             }
+                    let comm_window = inclusion_proofs[0].root();
 
-        //             if !inclusion_proof.validate(challenged_leaf_start as usize) {
-        //                 return Ok(false);
-        //             }
-        //         }
-        //     }
-        // }
+                    for (n, inclusion_proof) in inclusion_proofs.iter().enumerate() {
+                        trace!("inclusion_proof {}", n);
+                        let challenge_index = ((j * num_sectors_per_chunk + i)
+                            * pub_params.window_challenge_count
+                            + n) as u64;
+                        let challenged_leaf_relative = generate_leaf_challenge(
+                            pub_params,
+                            pub_inputs.randomness,
+                            sector_id.into(),
+                            window_index as u64,
+                            challenge_index,
+                        )?;
 
-        // Ok(true)
+                        // validate all comm_windows match
+                        if inclusion_proof.root() != comm_window {
+                            trace!("invalid root");
+                            return Ok(false);
+                        }
+
+                        // validate the path length
+                        let expected_path_length = inclusion_proof
+                            .expected_len(pub_params.window_size as usize / NODE_SIZE);
+
+                        dbg!(
+                            &inclusion_proof,
+                            pub_params.window_size as usize / NODE_SIZE
+                        );
+                        if expected_path_length != inclusion_proof.path().len() {
+                            trace!(
+                                "invalid path length {} != {}",
+                                expected_path_length,
+                                inclusion_proof.path().len()
+                            );
+                            return Ok(false);
+                        }
+
+                        if !inclusion_proof.validate(challenged_leaf_relative as usize) {
+                            trace!("invalid inclusion proof");
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     fn satisfies_requirements(
@@ -493,7 +541,7 @@ impl<'a, Tree: 'a + MerkleTreeTrait> ProofScheme<'a> for NseWindowPoSt<'a, Tree>
 mod tests {
     use super::*;
 
-    use generic_array::typenum::{U0, U2, U4, U8};
+    use generic_array::typenum::{U0, U4, U8};
     use rand::SeedableRng;
     use rand_xorshift::XorShiftRng;
 
@@ -510,17 +558,20 @@ mod tests {
         Tree::Store: 'static,
     {
         let rng = &mut XorShiftRng::from_seed(crate::TEST_SEED);
+        // femme::with_level(log::LevelFilter::Trace);
 
-        let leaves = 64 * get_base_tree_count::<Tree>();
+        let window_leaves = 64;
+        let num_windows = get_base_tree_count::<Tree>();
+        let leaves = num_windows * window_leaves;
         let sector_size = leaves * NODE_SIZE;
-        let num_windows = 4;
         let num_layers = 4;
 
         let pub_params = PublicParams {
             sector_size: sector_size as u64,
-            window_size: sector_size as u64 / num_windows,
+            window_size: window_leaves as u64 * NODE_SIZE as u64,
             window_challenge_count: 2,
             sector_count,
+            num_layers: 4,
         };
 
         let randomness = <Tree::Hasher as Hasher>::Domain::random(rng);
@@ -540,21 +591,22 @@ mod tests {
             trees.push(tree);
         }
         for (i, tree) in trees.iter().enumerate() {
-            let comm_layers = (0..num_layers)
+            let comm_layers: Vec<_> = (0..num_layers - 1)
                 .map(|_| <Tree::Hasher as Hasher>::Domain::random(rng))
                 .collect();
             let comm_replica = tree.root();
+            let comm_r: <Tree::Hasher as Hasher>::Domain =
+                hash_comm_r(&comm_layers, comm_replica).into();
 
             priv_sectors.push(PrivateSector {
                 tree,
                 comm_replica,
-                comm_layers: comm_layers.clone(),
+                comm_layers,
             });
 
             pub_sectors.push(PublicSector {
                 id: (i as u64).into(),
-                comm_layers: comm_layers.clone(),
-                comm_replica,
+                comm_r,
             });
         }
 
@@ -585,31 +637,6 @@ mod tests {
     }
 
     #[test]
-    fn nse_window_post_pedersen_single_partition_matching_base_8() {
-        test_nse_window_post::<LCTree<PedersenHasher, U8, U0, U0>>(5, 5, 1);
-    }
-
-    #[test]
-    fn nse_window_post_poseidon_single_partition_matching_base_8() {
-        test_nse_window_post::<LCTree<PoseidonHasher, U8, U0, U0>>(5, 5, 1);
-    }
-
-    #[test]
-    fn nse_window_post_poseidon_single_partition_smaller_base_8() {
-        test_nse_window_post::<LCTree<PoseidonHasher, U8, U0, U0>>(3, 5, 1);
-    }
-
-    #[test]
-    fn nse_window_post_poseidon_two_partitions_matching_base_8() {
-        test_nse_window_post::<LCTree<PoseidonHasher, U8, U0, U0>>(4, 2, 2);
-    }
-
-    #[test]
-    fn nse_window_post_poseidon_two_partitions_smaller_base_8() {
-        test_nse_window_post::<LCTree<PoseidonHasher, U8, U0, U0>>(5, 3, 2);
-    }
-
-    #[test]
     fn nse_window_post_pedersen_single_partition_matching_sub_8_4() {
         test_nse_window_post::<LCTree<PedersenHasher, U8, U4, U0>>(5, 5, 1);
     }
@@ -630,17 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn nse_window_post_poseidon_two_partitions_matching_sub_8_8() {
-        test_nse_window_post::<LCTree<PoseidonHasher, U8, U8, U0>>(4, 2, 2);
-    }
-
-    #[test]
     fn nse_window_post_poseidon_two_partitions_smaller_sub_8_4() {
         test_nse_window_post::<LCTree<PoseidonHasher, U8, U4, U0>>(5, 3, 2);
-    }
-
-    #[test]
-    fn nse_window_post_poseidon_two_partitions_smaller_sub_8_8() {
-        test_nse_window_post::<LCTree<PoseidonHasher, U8, U8, U0>>(5, 3, 2);
     }
 }

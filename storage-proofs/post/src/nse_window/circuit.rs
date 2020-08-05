@@ -237,6 +237,7 @@ mod tests {
         self, NseWindowPoSt, NseWindowPoStCompound, PrivateInputs, PrivateSector, PublicInputs,
         PublicSector,
     };
+    use storage_proofs_porep::nse::vanilla::hash_comm_r;
 
     #[test]
     fn nse_window_post_pedersen_single_partition_matching_base_8() {
@@ -278,9 +279,11 @@ mod tests {
     fn metric_nse_window_post_circuit_poseidon() {
         use bellperson::util_cs::bench_cs::BenchCS;
         let params = nse_window::SetupParams {
-            sector_size: 1024 * 1024 * 1024 * 32 as u64,
+            sector_size: 1024 * 1024 * 1024 * 32,
+            window_size: 1024 * 1024 * 32,
             window_challenge_count: 2,
             sector_count: 5,
+            num_layers: 4,
         };
 
         let pp = NseWindowPoSt::<OctMerkleTree<PoseidonHasher>>::setup(&params).unwrap();
@@ -311,8 +314,10 @@ mod tests {
 
         let pub_params = nse_window::PublicParams {
             sector_size: sector_size as u64,
+            window_size: 1024 * 1024,
             window_challenge_count: 2,
             sector_count,
+            num_layers: 4,
         };
 
         // Construct and store an MT using a named DiskStore.
@@ -330,16 +335,18 @@ mod tests {
         }
 
         for (i, tree) in trees.iter().enumerate() {
-            let comm_c = <Tree::Hasher as Hasher>::Domain::random(rng);
-            let comm_r_last = tree.root();
+            let comm_layers: Vec<_> = (0..pub_params.num_layers - 1)
+                .map(|_| <Tree::Hasher as Hasher>::Domain::random(rng))
+                .collect();
+            let comm_replica = tree.root();
+            let comm_r: <Tree::Hasher as Hasher>::Domain =
+                hash_comm_r(&comm_layers[..], comm_replica).into();
 
             priv_sectors.push(PrivateSector {
                 tree,
-                comm_c,
-                comm_r_last,
+                comm_replica,
+                comm_layers,
             });
-
-            let comm_r = <Tree::Hasher as Hasher>::Function::hash2(&comm_c, &comm_r_last);
             pub_sectors.push(PublicSector {
                 id: (i as u64).into(),
                 comm_r,
