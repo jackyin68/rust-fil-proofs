@@ -7,7 +7,6 @@ use paired::bls12_381::{Bls12, Fr};
 use storage_proofs_core::{
     compound_proof::{CircuitComponent, CompoundProof},
     error::Result,
-    gadgets::por::PoRCompound,
     merkle::MerkleTreeTrait,
     parameter_cache::{CacheableParameters, ParameterSetMetadata},
     por,

@@ -1,6 +1,7 @@
 use bellperson::gadgets::num;
 use bellperson::{Circuit, ConstraintSystem, SynthesisError};
 use ff::Field;
+use neptune::circuit::poseidon_hash;
 use paired::bls12_381::{Bls12, Fr};
 use rayon::prelude::*;
 
@@ -10,8 +11,9 @@ use storage_proofs_core::{
     gadgets::constraint,
     gadgets::por::{AuthPath, PoRCircuit},
     gadgets::variables::Root,
-    hasher::{HashFunction, Hasher},
-    merkle::MerkleTreeTrait,
+    hasher::types::POSEIDON_CONSTANTS_15_BASE,
+    hasher::Hasher,
+    merkle::{MerkleProofTrait, MerkleTreeTrait},
     por, settings,
     util::NODE_SIZE,
 };
@@ -27,11 +29,26 @@ pub struct NseWindowPoStCircuit<Tree: MerkleTreeTrait> {
 #[derive(Clone)]
 pub struct Sector<Tree: MerkleTreeTrait> {
     pub comm_r: Option<Fr>,
-    pub comm_c: Option<Fr>,
-    pub comm_r_last: Option<Fr>,
+    pub comm_replica: Option<Fr>,
+    pub comm_layers: Vec<Option<Fr>>,
+    pub windows: Vec<Window<Tree>>,
+    pub id: Option<Fr>,
+}
+
+pub struct Window<Tree: MerkleTreeTrait> {
+    pub root: Option<Fr>,
     pub leafs: Vec<Option<Fr>>,
     pub paths: Vec<AuthPath<Tree::Hasher, Tree::Arity, Tree::SubTreeArity, Tree::TopTreeArity>>,
-    pub id: Option<Fr>,
+}
+
+impl<Tree: MerkleTreeTrait> Clone for Window<Tree> {
+    fn clone(&self) -> Self {
+        Window {
+            root: self.root.clone(),
+            leafs: self.leafs.clone(),
+            paths: self.paths.clone(),
+        }
+    }
 }
 
 impl<Tree: 'static + MerkleTreeTrait> Sector<Tree> {
@@ -39,29 +56,59 @@ impl<Tree: 'static + MerkleTreeTrait> Sector<Tree> {
         sector: &PublicSector<<Tree::Hasher as Hasher>::Domain>,
         vanilla_proof: &SectorProof<Tree::Proof>,
     ) -> Result<Self> {
-        todo!()
-        // let leafs = vanilla_proof
-        //     .leafs()
-        //     .iter()
-        //     .map(|l| Some((*l).into()))
-        //     .collect();
+        let windows = vanilla_proof
+            .inclusion_proofs
+            .iter()
+            .map(|proofs| {
+                let root = proofs[0].root();
+                let leafs = proofs
+                    .iter()
+                    .map(MerkleProofTrait::leaf)
+                    .map(Into::into)
+                    .map(Some)
+                    .collect();
+                let paths = proofs
+                    .iter()
+                    .map(MerkleProofTrait::as_options)
+                    .map(Into::into)
+                    .collect();
 
-        // let paths = vanilla_proof
-        //     .as_options()
-        //     .into_iter()
-        //     .map(Into::into)
-        //     .collect();
+                Window {
+                    root: Some(root.into()),
+                    leafs,
+                    paths,
+                }
+            })
+            .collect();
 
-        // Ok(Sector {
-        //     leafs,
-        //     id: Some(sector.id.into()),
-        //     comm_r: Some(sector.comm_r.into()),
-        //     comm_c: Some(vanilla_proof.comm_c.into()),
-        //     comm_r_last: Some(vanilla_proof.comm_r_last.into()),
-        //     paths,
-        // })
+        Ok(Sector {
+            id: Some(sector.id.into()),
+            comm_r: Some(sector.comm_r.into()),
+            comm_replica: Some(vanilla_proof.comm_replica.into()),
+            comm_layers: vanilla_proof
+                .comm_layers
+                .iter()
+                .map(|c| Some((*c).into()))
+                .collect(),
+            windows,
+        })
     }
 
+    pub fn blank_circuit(pub_params: &PublicParams) -> Self {
+        let windows = vec![Window::blank_circuit(pub_params); pub_params.num_windows()];
+        let comm_layers = vec![None; pub_params.num_layers];
+
+        Sector {
+            id: None,
+            windows,
+            comm_r: None,
+            comm_replica: None,
+            comm_layers,
+        }
+    }
+}
+
+impl<Tree: MerkleTreeTrait> Window<Tree> {
     pub fn blank_circuit(pub_params: &PublicParams) -> Self {
         let challenges_count = pub_params.window_challenge_count;
         let leaves = pub_params.sector_size as usize / NODE_SIZE;
@@ -73,14 +120,36 @@ impl<Tree: 'static + MerkleTreeTrait> Sector<Tree> {
         let leafs = vec![None; challenges_count];
         let paths = vec![AuthPath::blank(por_params.leaves); challenges_count];
 
-        Sector {
-            id: None,
-            comm_r: None,
-            comm_c: None,
-            comm_r_last: None,
+        Window {
+            root: None,
             leafs,
             paths,
         }
+    }
+}
+
+impl<Tree: 'static + MerkleTreeTrait> Window<Tree> {
+    pub fn synthesize<CS: ConstraintSystem<Bls12>>(
+        &self,
+        mut cs: CS,
+        root_num: &num::AllocatedNum<Bls12>,
+    ) -> Result<(), SynthesisError> {
+        let Window { leafs, paths, .. } = self;
+
+        assert_eq!(paths.len(), leafs.len());
+
+        // Verify Inclusion Paths
+        for (i, (leaf, path)) in leafs.iter().zip(paths.iter()).enumerate() {
+            PoRCircuit::<Tree>::synthesize(
+                cs.namespace(|| format!("challenge_inclusion_{}", i)),
+                Root::Val(*leaf),
+                path.clone(),
+                Root::from_allocated::<CS>(root_num.clone()),
+                true,
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -88,28 +157,15 @@ impl<Tree: 'static + MerkleTreeTrait> Circuit<Bls12> for &Sector<Tree> {
     fn synthesize<CS: ConstraintSystem<Bls12>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         let Sector {
             comm_r,
-            comm_c,
-            comm_r_last,
-            leafs,
-            paths,
+            comm_layers,
+            comm_replica,
+            windows,
             ..
         } = self;
 
-        assert_eq!(paths.len(), leafs.len());
+        // 1. Verify comm_r = H(comm_layer_0 | ..)
 
-        // 1. Verify comm_r
-        let comm_r_last_num = num::AllocatedNum::alloc(cs.namespace(|| "comm_r_last"), || {
-            comm_r_last
-                .map(Into::into)
-                .ok_or_else(|| SynthesisError::AssignmentMissing)
-        })?;
-
-        let comm_c_num = num::AllocatedNum::alloc(cs.namespace(|| "comm_c"), || {
-            comm_c
-                .map(Into::into)
-                .ok_or_else(|| SynthesisError::AssignmentMissing)
-        })?;
-
+        // Allocate comm_r
         let comm_r_num = num::AllocatedNum::alloc(cs.namespace(|| "comm_r"), || {
             comm_r
                 .map(Into::into)
@@ -118,31 +174,76 @@ impl<Tree: 'static + MerkleTreeTrait> Circuit<Bls12> for &Sector<Tree> {
 
         comm_r_num.inputize(cs.namespace(|| "comm_r_input"))?;
 
-        // 1. Verify H(Comm_C || comm_r_last) == comm_r
-        {
-            let hash_num = <Tree::Hasher as Hasher>::Function::hash2_circuit(
-                cs.namespace(|| "H_comm_c_comm_r_last"),
-                &comm_c_num,
-                &comm_r_last_num,
-            )?;
+        // Allocate comm_layers
+        let mut comm_layers_nums = Vec::with_capacity(comm_layers.len());
+        for (layer_index, comm_layer) in comm_layers.iter().enumerate() {
+            let mut cs = cs.namespace(|| format!("layer_{}", layer_index));
+            let comm_layer_num = num::AllocatedNum::alloc(cs.namespace(|| "comm_layer"), || {
+                comm_layer
+                    .map(Into::into)
+                    .ok_or_else(|| SynthesisError::AssignmentMissing)
+            })?;
 
-            // Check actual equality
+            comm_layer_num.inputize(cs.namespace(|| "comm_layer_input"))?;
+            comm_layers_nums.push(comm_layer_num);
+        }
+
+        // Allocate comm_replica
+        let comm_replica_num = num::AllocatedNum::alloc(cs.namespace(|| "comm_replica"), || {
+            comm_replica
+                .map(Into::into)
+                .ok_or_else(|| SynthesisError::AssignmentMissing)
+        })?;
+
+        comm_replica_num.inputize(cs.namespace(|| "comm_replica_input"))?;
+
+        // comm_layers only includes the layers that are not the replica, so need to add it here.
+        comm_layers_nums.push(comm_replica_num);
+
+        // Verify equality
+        {
+            let c = POSEIDON_CONSTANTS_15_BASE.with_length(comm_layers_nums.len());
+            let hash_num = poseidon_hash(
+                &mut cs.namespace(|| "comm_layers_hash"),
+                comm_layers_nums.clone(),
+                &c,
+            )?;
             constraint::equal(
                 cs,
-                || "enforce_comm_c_comm_r_last_hash_comm_r",
+                || "enforce comm_r = H(comm_layers)",
                 &comm_r_num,
                 &hash_num,
             );
         }
 
-        // 2. Verify Inclusion Paths
-        for (i, (leaf, path)) in leafs.iter().zip(paths.iter()).enumerate() {
-            PoRCircuit::<Tree>::synthesize(
-                cs.namespace(|| format!("challenge_inclusion_{}", i)),
-                Root::Val(*leaf),
-                path.clone(),
-                Root::from_allocated::<CS>(comm_r_last_num.clone()),
-                true,
+        // 2. Verify comm_replica = Root(MerkleTree(comm_window_0 | ..))
+
+        // Allocate window roots
+        let mut window_roots = Vec::with_capacity(windows.len());
+        for (window_index, window) in windows.iter().enumerate() {
+            let mut cs = cs.namespace(|| format!("win_{}", window_index));
+            let window_root_num = num::AllocatedNum::alloc(cs.namespace(|| "window_root"), || {
+                window
+                    .root
+                    .map(Into::into)
+                    .ok_or_else(|| SynthesisError::AssignmentMissing)
+            })?;
+
+            window_root_num.inputize(cs.namespace(|| "window_root_input"))?;
+            window_roots.push(window_root_num);
+        }
+
+        // Construct Top MerkleTree
+        // TODO
+
+        // Compare comm_replica with constructed version.
+        // TODO:
+
+        // 3. Verify windows
+        for (window_index, window) in windows.iter().enumerate() {
+            window.synthesize(
+                cs.namespace(|| format!("window_proof_{}", window_index)),
+                &window_roots[window_index],
             )?;
         }
 
