@@ -372,8 +372,10 @@ mod tests {
     };
 
     use crate::nse::{
-        circuit::NseCompound, Config, PrivateInputs, PublicInputs, SetupParams, TemporaryAux,
-        TemporaryAuxCache,
+        circuit::NseCompound,
+        vanilla::{
+            Config, PrivateInputs, PublicInputs, SetupParams, TemporaryAux, TemporaryAuxCache,
+        },
     };
     use crate::PoRep;
 

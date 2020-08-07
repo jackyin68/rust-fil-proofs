@@ -223,7 +223,7 @@ mod tests {
         util::default_rows_to_discard,
     };
 
-    use crate::nse::{
+    use crate::nse::vanilla::{
         ChallengeRequirements, Config, PrivateInputs, PublicInputs, SetupParams, TemporaryAux,
         TemporaryAuxCache,
     };
